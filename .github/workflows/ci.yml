@@ -5,31 +5,117 @@ on:
     branches:
     - '**'
   pull_request:
-    branches:
-    - master
 
 jobs:
   # Dockerfile tests
   docker-build-test:
     runs-on: ubuntu-latest
-    name: Build and Test
+    name: Build docker image
 
     steps:
     - uses: actions/checkout@v2
-    - name: install kubebuilder
-      run: |
+    - run: |
         curl -L https://github.com/kubernetes-sigs/kubebuilder/releases/download/v2.3.1/kubebuilder_2.3.1_linux_amd64.tar.gz | tar -xz -C /tmp/
         sudo mv /tmp/kubebuilder_2.3.1_linux_amd64 /usr/local/kubebuilder
-    - run: make test docker-build
-    - name: Docker Build & Push to Docker Hub
-      if: ${{ github.ref == 'refs/heads/master' }}
-      uses: opspresso/action-docker@master
+    - run: make docker-build
+
+  docker-lint:
+    runs-on: ubuntu-latest
+    name: DockerLint
+    steps: 
+    - name: Checkout
+      uses: actions/checkout@v2
+    - name: lint
+      uses: brpaz/hadolint-action@master
+
+  # Golang tests
+  go-lint:
+    runs-on: ubuntu-latest
+    name: GoLint
+    steps:
+    - uses: actions/checkout@v2
+    - name: Run golangci-lint
+      uses: actions-contrib/golangci-lint@v1
       with:
-        args: --docker
-      env:
-        USERNAME: ${{ secrets.DOCKER_USER }}
-        PASSWORD: ${{ secrets.DOCKER_TOKEN }}
-        DOCKERFILE: Dockerfile
-        IMAGE_NAME: goharbor/harbor-cluster-operator
-        TAG_NAME: dev
-        LATEST: 'false'
+        golangci_lint_version: 1.22.2
+
+  go-dependencies:
+    runs-on: ubuntu-latest
+    name: Dependencies are up to date
+    steps:
+    - uses: actions/setup-go@v1
+      with:
+        go-version: 1.13
+    - name: Checkout
+      uses: actions/checkout@v2
+    - run: go mod tidy
+    - run: go mod vendor
+    - run: go mod graph
+    - run: git status
+    - name: Check diff
+      run: test -z "$(git diff-index --diff-filter=d --name-only HEAD -- 'vendor' | grep -v 'vendor/modules.txt')"
+  
+  check-generated-go-files:
+    runs-on: ubuntu-latest
+    name: Generated files are up to date
+    steps:
+    - uses: actions/setup-go@v1
+      with:
+        go-version: 1.13
+    - name: Checkout
+      uses: actions/checkout@v2
+    - run: make generate
+    - name: Check diff
+      run: |
+        git restore -- go.mod go.sum
+        git diff-index --exit-code --ignore-cr-at-eol HEAD
+
+  go-tests:
+    runs-on: ubuntu-latest
+    name: K8S v${{ matrix.k8sVersion }} (CM v${{ matrix.certManager }})
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # https://github.com/jetstack/cert-manager/tags
+        certManager: ["0.15.2","0.16.1"] # "1.0.0" not support yet
+        # https://snapcraft.io/microk8s
+        k8sVersion: ["1.17","1.18"]
+
+    steps: 
+    - name: Set up Go 1.13
+      uses: actions/setup-go@v1
+      with:
+        go-version: 1.13
+    - name: Install Kubernetes v${{ matrix.k8sVersion }}
+      run: |
+        sudo snap install microk8s --channel='${{ matrix.k8sVersion }}/stable' --classic
+
+        sudo microk8s.start
+
+        # https://microk8s.io/docs/addons
+        sudo microk8s.enable dns
+    - name: Wait for Kubernetes to be ready
+      timeout-minutes: 15
+      run: |
+        while [[ ! $(sudo microk8s.kubectl cluster-info) ]] ; do
+          echo "kubernetes not ready yet..." >&2
+          sleep 1
+        done
+    - name: Install CertManager v${{ matrix.certManager }}
+      run: |
+        # Try the recet way to install crd or fallback to the old one
+        version='${{ matrix.certManager }}'
+        shortVersion=""${version%.*}""
+        sudo microk8s.kubectl apply -f "https://github.com/jetstack/cert-manager/releases/download/v${version}/cert-manager.yaml" ||
+        sudo microk8s.kubectl apply -f "https://raw.githubusercontent.com/jetstack/cert-manager/release-${shortVersion}/deploy/manifests/00-crds.yaml"
+    - uses: actions/checkout@v2
+    - name: tests
+      run: |
+        export KUBECONFIG="$(realpath "$(mktemp kubeconfig.XXXXX)")"
+        export USE_EXISTING_CLUSTER="true"
+        sudo microk8s.config > "${KUBECONFIG}"
+
+        make docker-build
+        kubectl apply -f manifests/all-in-one.yaml
+        
