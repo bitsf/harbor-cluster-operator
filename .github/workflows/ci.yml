@@ -45,7 +45,7 @@ jobs:
     steps:
     - uses: actions/setup-go@v1
       with:
-        go-version: 1.13
+        go-version: 1.14
     - name: Checkout
       uses: actions/checkout@v2
     - run: go mod tidy
@@ -61,7 +61,7 @@ jobs:
     steps:
     - uses: actions/setup-go@v1
       with:
-        go-version: 1.13
+        go-version: 1.14
     - name: Checkout
       uses: actions/checkout@v2
     - run: make generate
@@ -86,36 +86,165 @@ jobs:
     - name: Set up Go 1.13
       uses: actions/setup-go@v1
       with:
-        go-version: 1.13
+        go-version: 1.14
+
     - name: Install Kubernetes v${{ matrix.k8sVersion }}
       run: |
-        sudo snap install microk8s --channel='${{ matrix.k8sVersion }}/stable' --classic
+        curl -Lo ./kind https://github.com/kubernetes-sigs/kind/releases/download/v0.7.0/kind-$(uname)-amd64; sudo install kind /usr/local/bin/
+        curl -sSL "https://go.kubebuilder.io/dl/2.0.1/$(go env GOOS)/$(go env GOARCH)" | tar -xz -C /tmp/;sudo mv /tmp/kubebuilder_2.0.1_$(go env GOOS)_$(go env GOARCH) /usr/local/kubebuilder
+        cat <<EOF | kind create cluster --name harbor --config=-
+        kind: Cluster
+        apiVersion: kind.x-k8s.io/v1alpha4
+        nodes:
+        - role: control-plane
+        - role: worker
+        - role: worker
+        - role: worker
+        EOF
 
-        sudo microk8s.start
+    - uses: actions/checkout@v2
 
-        # https://microk8s.io/docs/addons
-        sudo microk8s.enable dns
-    - name: Wait for Kubernetes to be ready
-      timeout-minutes: 15
-      run: |
-        while [[ ! $(sudo microk8s.kubectl cluster-info) ]] ; do
-          echo "kubernetes not ready yet..." >&2
-          sleep 1
-        done
     - name: Install CertManager v${{ matrix.certManager }}
       run: |
         # Try the recet way to install crd or fallback to the old one
         version='${{ matrix.certManager }}'
-        shortVersion=""${version%.*}""
-        sudo microk8s.kubectl apply -f "https://github.com/jetstack/cert-manager/releases/download/v${version}/cert-manager.yaml" ||
-        sudo microk8s.kubectl apply -f "https://raw.githubusercontent.com/jetstack/cert-manager/release-${shortVersion}/deploy/manifests/00-crds.yaml"
-    - uses: actions/checkout@v2
-    - name: tests
-      run: |
-        export KUBECONFIG="$(realpath "$(mktemp kubeconfig.XXXXX)")"
-        export USE_EXISTING_CLUSTER="true"
-        sudo microk8s.config > "${KUBECONFIG}"
+        kubectl apply -f "https://github.com/jetstack/cert-manager/releases/download/v${version}/cert-manager.yaml"
+        sleep 5
+        kubectl -n cert-manager wait --for=condition=Available deployment --all --timeout 300s
 
+    - name: Install Ingress
+      run: |
+        kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v0.35.0/deploy/static/provider/baremetal/deploy.yaml
+        sleep 5
+        kubectl -n ingress-nginx wait --for=condition=Available deployment --all --timeout 300s
+
+    - name: Install harbor-cluster-operator
+      run: |
+        set -xe
         make docker-build
         kubectl apply -f manifests/all-in-one.yaml
-        
+        sleep 10
+        kubectl -n harbor-cluster-operator-system wait --for=condition=Available deployment --all --timeout 300s
+        kubectl get all -n harbor-cluster-operator-system
+        kubectl get all -n harbor-operator-system
+
+    - name: Install harbor
+      run: |
+        set -xe
+        IP=`hostname -I | awk '{print $1}'`
+        echo "::set-env name=IP::$IP"
+
+        cat <<EOF | kubectl apply -f -
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: harbor
+        ---
+        # A secret of harbor admin password.
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: admin-secret
+          namespace: harbor
+        data:
+          password: SGFyYm9yMTIzNDU=
+        type: Opaque
+        ---
+        apiVersion: cert-manager.io/v1alpha2
+        kind: Issuer
+        metadata:
+          name: selfsigned-issuer
+          namespace: harbor
+        spec:
+          selfSigned:
+            crlDistributionPoints:
+            - "https://harbor.${IP}.xip.io"
+            - "https://notary-harbor.${IP}.xip.io"
+        ---
+        apiVersion: goharbor.io/v1
+        kind: HarborCluster
+        metadata:
+          name: sz-harbor-cluster
+          namespace: harbor
+        spec:
+          redis:
+            kind: "inCluster"
+            spec:
+              server:
+                replicas: 1
+                resources:
+                  requests:
+                    cpu: "1"
+                    memory: "500Mi"
+                storage: "10Gi"
+              sentinel:
+                replicas: 1
+              schema: "redis"
+          adminPasswordSecret: "admin-secret"
+          certificateIssuerRef:
+            name: selfsigned-issuer
+          tlsSecret: public-certificate
+          database:
+            kind: "inCluster"
+            spec:
+              replicas: 2
+              resources:
+                requests:
+                  cpu: "1"
+                  memory: "500Mi"
+                limits:
+                  cpu: "1"
+                  memory: "1Gi"
+          publicURL: "https://harbor.${IP}.xip.io"
+          replicas: 3
+          notary:
+            publicUrl: "https://notary-harbor.${IP}.xip.io"
+          disableRedirect: true
+          jobService:
+            workerCount: 10
+            replicas: 3
+          chartMuseum:
+            absoluteURL: true
+          clair:
+            updateInterval: 10
+            vulnerabilitySources:
+            - ubuntu
+            - alphine
+          storage:
+            kind: "inCluster"
+            options:
+              provider: minIO
+              spec:
+                replicas: 3
+                volumesPerServer: 2
+                version: RELEASE.2020-08-13T02-39-50Z
+                volumeClaimTemplate:
+                  spec:
+                    storageClassName: standard
+                    accessModes:
+                      - ReadWriteOnce
+                    resources:
+                      requests:
+                        storage: 10Gi
+                resources:
+                  requests:
+                    memory: 500Mi
+                    cpu: 500m
+                  limits:
+                    memory: 1Gi
+                    cpu: 1000m
+          version: 1.10.0
+        EOF
+
+        sleep 200
+        kubectl get all -n harbor
+        free -h
+        kubectl -n harbor wait --for=condition=Ready pod --all --timeout 600s || echo failed install harbor
+        kubectl get all -n harbor
+        free -h
+ 
+    - name: tests
+      run: |
+        sudo kubectl port-forward -n ingress-nginx service/ingress-nginx-controller 443:443 --address=0.0.0.0 &
+        sleep 10
+        curl -L -k -f -i "https://harbor.${IP}.xip.io/api/systeminfo"
