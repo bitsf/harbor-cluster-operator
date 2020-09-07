@@ -7,18 +7,6 @@ on:
   pull_request:
 
 jobs:
-  # Dockerfile tests
-  docker-build-test:
-    runs-on: ubuntu-latest
-    name: Build docker image
-
-    steps:
-    - uses: actions/checkout@v2
-    - run: |
-        curl -L https://github.com/kubernetes-sigs/kubebuilder/releases/download/v2.3.1/kubebuilder_2.3.1_linux_amd64.tar.gz | tar -xz -C /tmp/
-        sudo mv /tmp/kubebuilder_2.3.1_linux_amd64 /usr/local/kubebuilder
-    - run: make docker-build
-
   docker-lint:
     runs-on: ubuntu-latest
     name: DockerLint
@@ -39,48 +27,40 @@ jobs:
       with:
         golangci_lint_version: 1.22.2
 
-  go-dependencies:
-    runs-on: ubuntu-latest
-    name: Dependencies are up to date
-    steps:
-    - uses: actions/setup-go@v1
-      with:
-        go-version: 1.14
-    - name: Checkout
-      uses: actions/checkout@v2
-    - run: go mod tidy
-    - run: go mod vendor
-    - run: go mod graph
-    - run: git status
-    - name: Check diff
-      run: test -z "$(git diff-index --diff-filter=d --name-only HEAD -- 'vendor' | grep -v 'vendor/modules.txt')"
-  
-  check-generated-go-files:
-    runs-on: ubuntu-latest
-    name: Generated files are up to date
-    steps:
-    - uses: actions/setup-go@v1
-      with:
-        go-version: 1.14
-    - name: Checkout
-      uses: actions/checkout@v2
-    - run: make generate
-    - name: Check diff
-      run: |
-        git restore -- go.mod go.sum
-        git diff-index --exit-code --ignore-cr-at-eol HEAD
+  # go-dependencies:
+  #   runs-on: ubuntu-latest
+  #   name: Dependencies are up to date
+  #   steps:
+  #   - uses: actions/setup-go@v1
+  #     with:
+  #       go-version: 1.14
+  #   - name: Checkout
+  #     uses: actions/checkout@v2
+  #   - run: go mod tidy
+  #   - run: go mod vendor
+  #   - run: go mod graph
+  #   - run: git status
+  #   - name: Check diff
+  #     run: |
+  #       git diff-index --diff-filter=d --name-only --ignore-cr-at-eol HEAD -- 'vendor'
+  #       test -z "$(git diff-index --diff-filter=d --name-only --ignore-cr-at-eol HEAD -- 'vendor' | grep -v 'vendor/modules.txt')"
+  #   - run: make generate
+  #   - name: Check diff
+  #     run: |
+  #       git restore -- go.mod go.sum
+  #       git diff-index --exit-code --ignore-cr-at-eol HEAD
 
   go-tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest # self-hosted
     name: K8S v${{ matrix.k8sVersion }} (CM v${{ matrix.certManager }})
 
     strategy:
       fail-fast: false
       matrix:
         # https://github.com/jetstack/cert-manager/tags
-        certManager: ["0.15.2","0.16.1"] # "1.0.0" not support yet
+        certManager: ["0.16.1"] # "0.15.2" # "1.0.0" not support yet
         # https://snapcraft.io/microk8s
-        k8sVersion: ["1.17","1.18"]
+        k8sVersion: ["1.18"] #"1.17"
 
     steps: 
     - name: Set up Go 1.13
@@ -90,8 +70,8 @@ jobs:
 
     - name: Install Kubernetes v${{ matrix.k8sVersion }}
       run: |
-        curl -Lo ./kind https://github.com/kubernetes-sigs/kind/releases/download/v0.7.0/kind-$(uname)-amd64; sudo install kind /usr/local/bin/
-        curl -sSL "https://go.kubebuilder.io/dl/2.0.1/$(go env GOOS)/$(go env GOARCH)" | tar -xz -C /tmp/;sudo mv /tmp/kubebuilder_2.0.1_$(go env GOOS)_$(go env GOARCH) /usr/local/kubebuilder
+        which kind || (curl -Lo ./kind https://github.com/kubernetes-sigs/kind/releases/download/v0.7.0/kind-$(uname)-amd64; sudo install kind /usr/local/bin/)
+        ls /usr/local/kubebuilder || (curl -sSL "https://go.kubebuilder.io/dl/2.0.1/$(go env GOOS)/$(go env GOARCH)" | tar -xz -C /tmp/;sudo mv /tmp/kubebuilder_2.0.1_$(go env GOOS)_$(go env GOARCH) /usr/local/kubebuilder)
         cat <<EOF | kind create cluster --name harbor --config=-
         kind: Cluster
         apiVersion: kind.x-k8s.io/v1alpha4
@@ -174,8 +154,8 @@ jobs:
                 replicas: 1
                 resources:
                   requests:
-                    cpu: "1"
-                    memory: "500Mi"
+                    cpu: "100m"
+                    memory: "300Mi"
                 storage: "10Gi"
               sentinel:
                 replicas: 1
@@ -187,22 +167,22 @@ jobs:
           database:
             kind: "inCluster"
             spec:
-              replicas: 2
+              replicas: 1
               resources:
                 requests:
-                  cpu: "1"
-                  memory: "500Mi"
+                  cpu: "100m"
+                  memory: "300Mi"
                 limits:
-                  cpu: "1"
-                  memory: "1Gi"
+                  cpu: "500m"
+                  memory: "500Mi"
           publicURL: "https://harbor.${IP}.xip.io"
-          replicas: 3
+          replicas: 1
           notary:
             publicUrl: "https://notary-harbor.${IP}.xip.io"
           disableRedirect: true
           jobService:
             workerCount: 10
-            replicas: 3
+            replicas: 1
           chartMuseum:
             absoluteURL: true
           clair:
@@ -228,20 +208,28 @@ jobs:
                         storage: 10Gi
                 resources:
                   requests:
+                    memory: 200Mi
+                    cpu: 200m
+                  limits:
                     memory: 500Mi
                     cpu: 500m
-                  limits:
-                    memory: 1Gi
-                    cpu: 1000m
           version: 1.10.0
         EOF
 
-        sleep 200
-        kubectl get all -n harbor
         free -h
+        for i in $(seq 1 10);do
+          sleep 30
+          echo $i
+          kubectl get all -n harbor
+        done
         kubectl -n harbor wait --for=condition=Ready pod --all --timeout 600s || echo failed install harbor
         kubectl get all -n harbor
         free -h
+        for n in $(kubectl get po -n harbor |grep -v Running|grep 'sz-harbor'|awk '{print $1}');do
+          echo describe $n
+          kubectl describe pod -n harbor $n
+        done
+        
  
     - name: tests
       run: |
